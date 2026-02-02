@@ -1,12 +1,16 @@
 """
-Detailed Experiment: α in 0.1 steps, noise rate in 1% steps
+Experiment: α from -1.0 to +0.9
 
 Configuration:
-- α values: 11 values [0.0, -0.1, -0.2, ..., -1.0] (0.1 steps)
+- α values: 20 values [-1.0, -0.9, ..., 0.0, 0.1, ..., 0.9] (0.1 steps)
 - noise_rates: 31 values [0%, 1%, 2%, ..., 30%] (1% steps)
 
-Total runs: 11 × 31 = 341 runs
-Estimated time on RTX 3090 Ti: ~7-8 minutes
+Total runs: 20 × 31 = 620 runs
+
+Output:
+- Figure 1: Heatmap + Optimal α curve
+- Figure 2: Comparison of α=-1, -0.5, 0, 0.3, 0.5, 0.7
+- Figure 3: Difference plot (red/blue bar chart)
 """
 
 import numpy as np
@@ -18,13 +22,13 @@ from tqdm import tqdm
 import json
 import os
 
-#==============================================================================
+# ================================================================================
 # Setup
-#==============================================================================
+# ================================================================================
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Device: {device}")
 
-SAVE_DIR = 'experiment_detailed'
+SAVE_DIR = 'experiment_extended'
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 def set_seed(seed=42):
@@ -33,14 +37,15 @@ def set_seed(seed=42):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-
-#==============================================================================
+# ================================================================================
 # Network
-#==============================================================================
+# ================================================================================
 class RescaledLeakyReLU(nn.Module):
-    """Rescaled Leaky ReLU: sigma_alpha(z) / sqrt(1 + alpha^2)"""
+    """Rescaled Leaky ReLU: σ_α(z) / sqrt(1 + α²)"""
     def __init__(self, alpha):
         super().__init__()
+        if alpha >= 1.0:
+            raise ValueError(f"α must be < 1, got {alpha}")
         self.alpha = alpha
         self.scale = 1.0 / np.sqrt(1 + alpha**2)
     
@@ -49,14 +54,12 @@ class RescaledLeakyReLU(nn.Module):
 
 
 class OverparameterizedDNN(nn.Module):
-    """Network with fixed A, B and trainable W (matching the thesis)"""
+    """Network with fixed A, B and trainable W"""
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers, alpha):
         super().__init__()
         self.alpha = alpha
-        # Fixed input/output matrices
         self.register_buffer('A', torch.randn(hidden_dim, input_dim) / np.sqrt(hidden_dim))
         self.register_buffer('B', torch.randn(output_dim, hidden_dim) / np.sqrt(output_dim))
-        # Trainable hidden weights (He initialization)
         self.weights = nn.ParameterList([
             nn.Parameter(torch.randn(hidden_dim, hidden_dim) * np.sqrt(2.0 / hidden_dim))
             for _ in range(num_layers)
@@ -69,10 +72,9 @@ class OverparameterizedDNN(nn.Module):
             h = self.activation(torch.mm(h, W.t()))
         return torch.mm(h, self.B.t())
 
-
-#==============================================================================
+# ================================================================================
 # Data
-#==============================================================================
+# ================================================================================
 def load_mnist(n_train, n_test, seed=42):
     from torchvision import datasets, transforms
     
@@ -99,14 +101,7 @@ def load_mnist(n_train, n_test, seed=42):
 
 
 def inject_label_noise(Y, noise_rate, num_classes=10):
-    """
-    Inject symmetric label noise.
-    
-    For each sample with probability noise_rate:
-      Replace true label y with a uniformly random incorrect label y' != y
-    
-    This satisfies Assumption 2.4 (sparse label corruption) with rate rho = noise_rate.
-    """
+    """Symmetric label noise injection"""
     Y_noisy = Y.clone()
     n_corrupt = int(len(Y) * noise_rate)
     corrupted_mask = torch.zeros(len(Y), dtype=torch.bool)
@@ -130,10 +125,9 @@ def to_regression_targets(Y, num_classes=10):
     targets[torch.arange(n), Y] = 1.0
     return targets
 
-
-#==============================================================================
-# Training with Full Recording
-#==============================================================================
+# ================================================================================
+# Training
+# ================================================================================
 def train_full_recording(model, X_train, Y_train_noisy, Y_train_clean,
                          X_test, Y_test_noisy, Y_test_clean,
                          epochs, lr, record_every=1):
@@ -208,10 +202,9 @@ def train_full_recording(model, X_train, Y_train_noisy, Y_train_clean,
     
     return history
 
-
-#==============================================================================
-# Analysis Functions
-#==============================================================================
+# ================================================================================
+# Analysis
+# ================================================================================
 def verify_theorem_3_1(history, alpha):
     L_nu = np.array(history['L_nu'])
     epochs = np.array(history['epoch'])
@@ -266,24 +259,271 @@ def find_optimal_stopping(history):
     
     return {
         'T_star': int(T_star),
-        'min_R_clean': min_R_clean,
-        'L_nu_at_Tstar': L_nu_at_Tstar,
-        'final_R_clean': final_R_clean,
-        'final_L_nu': final_L_nu,
-        'improvement': (final_R_clean - min_R_clean) / final_R_clean * 100
+        'min_R_clean': float(min_R_clean),
+        'L_nu_at_Tstar': float(L_nu_at_Tstar),
+        'final_R_clean': float(final_R_clean),
+        'final_L_nu': float(final_L_nu),
+        'improvement': float((final_R_clean - min_R_clean) / final_R_clean * 100)
     }
 
+# ================================================================================
+# Save/Load
+# ================================================================================
+def convert_for_json(obj):
+    """Convert numpy types to Python native types for JSON serialization"""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {str(k): convert_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_for_json(i) for i in obj]
+    elif isinstance(obj, (np.integer,)):
+        return int(obj)
+    elif isinstance(obj, (np.floating,)):
+        return float(obj)
+    elif isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    return obj
 
-#==============================================================================
+
+def save_results(results, filename):
+    path = os.path.join(SAVE_DIR, filename)
+    with open(path, 'w') as f:
+        json.dump(convert_for_json(results), f, indent=2)
+    print(f"  Saved: {path}")
+
+# ================================================================================
+# Visualization (3 Figures, NaN-safe)
+# ================================================================================
+def safe_get_R(exp, alpha_str):
+    """Safely get R value, returning np.nan if not available"""
+    res = exp['alpha_results'].get(alpha_str, {})
+    t34 = res.get('theorem_3_4')
+    if t34 and t34.get('min_R_clean') is not None:
+        return t34['min_R_clean']
+    return np.nan
+
+
+def plot_results(results):
+    """Generate 3 figures (NaN-safe version)"""
+    noise_rates = sorted([exp['noise_rate'] for exp in results['experiments']])
+    alpha_values = sorted([float(a) for a in results['experiments'][0]['alpha_results'].keys()])
+    
+    # Build R_matrix
+    R_matrix = np.zeros((len(noise_rates), len(alpha_values)))
+    
+    for i, exp in enumerate(sorted(results['experiments'], key=lambda x: x['noise_rate'])):
+        for j, alpha in enumerate(alpha_values):
+            alpha_str = str(alpha)
+            R_matrix[i, j] = safe_get_R(exp, alpha_str)
+    
+    # ========== Figure 1: Heatmap + Optimal α ==========
+    print("\n" + "="*60)
+    print("Figure 1: Heatmap and Optimal α")
+    print("="*60)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    
+    ax = axes[0]
+    im = ax.imshow(R_matrix, aspect='auto', cmap='RdYlGn_r', origin='lower')
+    
+    xtick_step = max(1, len(alpha_values) // 10)
+    ytick_step = max(1, len(noise_rates) // 10)
+    
+    ax.set_xticks(range(0, len(alpha_values), xtick_step))
+    ax.set_xticklabels([f'{alpha_values[i]:.1f}' for i in range(0, len(alpha_values), xtick_step)])
+    ax.set_yticks(range(0, len(noise_rates), ytick_step))
+    ax.set_yticklabels([f'{noise_rates[i]*100:.0f}%' for i in range(0, len(noise_rates), ytick_step)])
+    
+    ax.set_xlabel('α (negative to positive)')
+    ax.set_ylabel('Noise Rate ρ')
+    ax.set_title('Test Loss R(T*) - Extended Range\n(Lighter = Better)')
+    plt.colorbar(im, ax=ax)
+    
+    # Mark best α (NaN-safe)
+    for i in range(len(noise_rates)):
+        row = R_matrix[i, :]
+        if not np.all(np.isnan(row)):
+            best_j = np.nanargmin(row)
+            ax.scatter([best_j], [i], marker='*', s=100, c='blue', edgecolors='white', linewidths=1)
+    
+    # Right: Best α vs noise rate (NaN-safe)
+    ax = axes[1]
+    best_alphas = []
+    valid_noise_rates = []
+    for i in range(len(noise_rates)):
+        row = R_matrix[i, :]
+        if not np.all(np.isnan(row)):
+            best_alphas.append(alpha_values[np.nanargmin(row)])
+            valid_noise_rates.append(noise_rates[i])
+    
+    ax.plot([r*100 for r in valid_noise_rates], best_alphas, 'bo-', markersize=4, linewidth=1)
+    ax.set_xlabel('Noise Rate ρ (%)')
+    ax.set_ylabel('Optimal α')
+    ax.set_title('Optimal α vs Noise Rate (Extended Range)')
+    ax.grid(True, alpha=0.3)
+    ax.axhline(y=0, color='red', linestyle='--', alpha=0.5, label='ReLU (α=0)')
+    ax.axhline(y=-1, color='green', linestyle=':', alpha=0.5, label='Absolute (α=-1)')
+    ax.axhline(y=0.5, color='orange', linestyle='-.', alpha=0.5, label='α=0.5')
+    ax.legend()
+    ax.set_ylim(-1.2, 1.0)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(SAVE_DIR, 'extended_heatmap.png'), dpi=150)
+    plt.show()
+    
+    # ========== Figure 2: α comparison ==========
+    print("\n" + "="*60)
+    print("Figure 2: Comparison of Negative, Zero, and Positive α")
+    print("="*60)
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    alpha_to_plot = [-1.0, -0.5, 0.0, 0.3, 0.5, 0.7]
+    colors = ['green', 'blue', 'red', 'orange', 'purple', 'brown']
+    markers = ['o', 's', '^', 'D', 'v', '<']
+    
+    for alpha, color, marker in zip(alpha_to_plot, colors, markers):
+        R_values = []
+        for exp in sorted(results['experiments'], key=lambda x: x['noise_rate']):
+            R_values.append(safe_get_R(exp, str(alpha)))
+        
+        if not all(np.isnan(v) for v in R_values):
+            ax.plot([r*100 for r in noise_rates], R_values, 
+                    color=color, marker=marker, linestyle='-',
+                    label=f'α={alpha}', markersize=4, linewidth=1.5)
+    
+    ax.set_xlabel('Noise Rate ρ (%)')
+    ax.set_ylabel('Test Loss R(T*)')
+    ax.set_title('Comparison: Negative, Zero, and Positive α')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(SAVE_DIR, 'alpha_comparison_extended.png'), dpi=150)
+    plt.show()
+    
+    # ========== Figure 3: Difference plot (red/blue bars) ==========
+    print("\n" + "="*60)
+    print("Figure 3: Difference Plot (α=0 vs α=-1)")
+    print("="*60)
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    diffs = []
+    valid_rhos = []
+    for exp in sorted(results['experiments'], key=lambda x: x['noise_rate']):
+        R_0 = safe_get_R(exp, '0.0')
+        R_neg1 = safe_get_R(exp, '-1.0')
+        if not np.isnan(R_0) and not np.isnan(R_neg1):
+            diffs.append(R_0 - R_neg1)
+            valid_rhos.append(exp['noise_rate'] * 100)
+    
+    colors = ['red' if d > 0 else 'blue' for d in diffs]
+    
+    ax.bar(valid_rhos, diffs, color=colors, width=0.8, alpha=0.7)
+    ax.axhline(y=0, color='black', linestyle='-', linewidth=1)
+    ax.set_xlabel('Noise Rate ρ (%)')
+    ax.set_ylabel('R(α=0) - R(α=-1)')
+    ax.set_title('Difference: Positive (Red) = α=-1 Better, Negative (Blue) = α=0 Better')
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    ax.bar([], [], color='red', alpha=0.7, label='α=-1 is better')
+    ax.bar([], [], color='blue', alpha=0.7, label='α=0 is better')
+    ax.legend()
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(SAVE_DIR, 'difference_plot_extended.png'), dpi=150)
+    plt.show()
+    
+    print(f"\nPlots saved to {SAVE_DIR}/")
+    
+    return diffs
+
+
+def print_summary(results, diffs):
+    """Print summary statistics"""
+    print("\n" + "="*60)
+    print("EXTENDED SUMMARY: Including α > 0")
+    print("="*60)
+    
+    print(f"\n{'ρ':<8} {'Best α':<10} {'R*(best)':<12} {'R*(α=-1)':<12} {'R*(α=0)':<12} {'R*(α=0.5)':<12}")
+    print("-"*80)
+    
+    for exp in sorted(results['experiments'], key=lambda x: x['noise_rate']):
+        noise_rate = exp['noise_rate']
+        if noise_rate not in [0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30]:
+            continue
+        
+        best_alpha = None
+        best_loss = float('inf')
+        
+        for alpha, data in exp['alpha_results'].items():
+            t34 = data.get('theorem_3_4')
+            if t34 and t34.get('min_R_clean') is not None:
+                if t34['min_R_clean'] < best_loss:
+                    best_loss = t34['min_R_clean']
+                    best_alpha = float(alpha)
+        
+        R_neg1 = safe_get_R(exp, '-1.0')
+        R_0 = safe_get_R(exp, '0.0')
+        R_05 = safe_get_R(exp, '0.5')
+        
+        if best_alpha is not None:
+            print(f"{noise_rate*100:5.0f}%   {best_alpha:8.1f}   {best_loss:<12.4f} {R_neg1:<12.4f} {R_0:<12.4f} {R_05:<12.4f}")
+    
+    # α region wins
+    print("\n" + "="*60)
+    print("ANALYSIS: Best α distribution")
+    print("="*60)
+    
+    wins = {'negative': 0, 'zero': 0, 'positive': 0}
+    for exp in results['experiments']:
+        best_alpha = None
+        best_loss = float('inf')
+        for alpha, data in exp['alpha_results'].items():
+            t34 = data.get('theorem_3_4')
+            if t34 and t34.get('min_R_clean') is not None:
+                if t34['min_R_clean'] < best_loss:
+                    best_loss = t34['min_R_clean']
+                    best_alpha = float(alpha)
+        
+        if best_alpha is not None:
+            if best_alpha < 0:
+                wins['negative'] += 1
+            elif best_alpha == 0:
+                wins['zero'] += 1
+            else:
+                wins['positive'] += 1
+    
+    total = sum(wins.values())
+    if total > 0:
+        print(f"\n  α < 0  (negative): {wins['negative']:3d} / {total} ({wins['negative']/total*100:.1f}%)")
+        print(f"  α = 0  (ReLU):     {wins['zero']:3d} / {total} ({wins['zero']/total*100:.1f}%)")
+        print(f"  α > 0  (positive): {wins['positive']:3d} / {total} ({wins['positive']/total*100:.1f}%)")
+    
+    # Difference statistics
+    if diffs:
+        print("\n" + "="*60)
+        print("ANALYSIS: R(α=0) - R(α=-1) statistics")
+        print("="*60)
+        diffs_array = np.array(diffs)
+        print(f"\n  Mean:   {np.mean(diffs_array):+.4f}")
+        print(f"  Std:    {np.std(diffs_array):.4f}")
+        print(f"  Min:    {np.min(diffs_array):+.4f} (α=0 most advantageous)")
+        print(f"  Max:    {np.max(diffs_array):+.4f} (α=-1 most advantageous)")
+        print(f"  α=-1 wins: {np.sum(diffs_array > 0)} / {len(diffs_array)} ({np.sum(diffs_array > 0)/len(diffs_array)*100:.1f}%)")
+
+# ================================================================================
 # Main Experiment
-#==============================================================================
-def run_detailed_experiment(config):
+# ================================================================================
+def run_experiment(config):
     print("\n" + "="*70)
-    print("Detailed Experiment: α (0.1 step) × ρ (1% step)")
+    print("Extended Experiment: α from -1.0 to +0.9")
     print("="*70)
     print(f"Config: {config['n_train']} train, {config['epochs']} epochs, lr={config['lr']}")
     print(f"α values: {len(config['alpha_values'])} values from {config['alpha_values'][0]} to {config['alpha_values'][-1]}")
-    print(f"Noise rates: {len(config['noise_rates'])} values from {config['noise_rates'][0]*100:.0f}% to {config['noise_rates'][-1]*100:.0f}%")
+    print(f"Noise rates: {len(config['noise_rates'])} values")
     
     all_results = {
         'config': config,
@@ -293,7 +533,7 @@ def run_detailed_experiment(config):
     total_runs = len(config['noise_rates']) * len(config['alpha_values'])
     pbar = tqdm(total=total_runs, desc="Total progress")
     
-    # Check for checkpoint
+    # Checkpoint loading
     checkpoint_path = os.path.join(SAVE_DIR, 'checkpoint.json')
     completed_noise_rates = set()
     if os.path.exists(checkpoint_path):
@@ -307,14 +547,12 @@ def run_detailed_experiment(config):
     for noise_rate in config['noise_rates']:
         if noise_rate in completed_noise_rates:
             continue
-            
-        # Load data once per noise rate
+        
         set_seed(config['seed'])
         X_train, Y_train_clean, X_test, Y_test_clean = load_mnist(
             config['n_train'], config['n_test'], config['seed']
         )
         
-        # Inject noise
         Y_train_noisy, corrupted_mask = inject_label_noise(
             Y_train_clean, noise_rate, config['num_classes']
         )
@@ -322,7 +560,6 @@ def run_detailed_experiment(config):
             Y_test_clean, noise_rate, config['num_classes']
         )
         
-        # Convert to regression targets
         Y_tr_noisy_reg = to_regression_targets(Y_train_noisy, config['num_classes'])
         Y_tr_clean_reg = to_regression_targets(Y_train_clean, config['num_classes'])
         Y_te_noisy_reg = to_regression_targets(Y_test_noisy, config['num_classes'])
@@ -357,12 +594,7 @@ def run_detailed_experiment(config):
             thm31 = verify_theorem_3_1(history, alpha)
             thm34 = find_optimal_stopping(history)
             
-            noise_results['alpha_results'][alpha] = {
-                'history': {
-                    'epoch': history['epoch'],
-                    'L_nu_per_sample': history['L_nu_per_sample'],
-                    'R_clean_per_sample': history['R_clean_per_sample'],
-                },
+            noise_results['alpha_results'][str(alpha)] = {
                 'theorem_3_1': thm31,
                 'theorem_3_4': thm34,
                 'diverged': history['diverged']
@@ -371,246 +603,16 @@ def run_detailed_experiment(config):
             pbar.update(1)
         
         all_results['experiments'].append(noise_results)
-        
-        # Save checkpoint every noise rate
         save_results(all_results, 'checkpoint.json')
-        
-        # Print progress
-        if (len(all_results['experiments'])) % 5 == 0:
-            print(f"\n  Completed {len(all_results['experiments'])}/{len(config['noise_rates'])} noise rates")
     
     pbar.close()
     
     return all_results
 
-
-#==============================================================================
-# Save/Load
-#==============================================================================
-def save_results(results, filename):
-    def convert(obj):
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        elif isinstance(obj, dict):
-            return {str(k): convert(v) for k, v in obj.items()}
-        elif isinstance(obj, list):
-            return [convert(i) for i in obj]
-        elif isinstance(obj, (np.integer,)):
-            return int(obj)
-        elif isinstance(obj, (np.floating,)):
-            return float(obj)
-        elif isinstance(obj, (np.bool_,)):
-            return bool(obj)
-        return obj
-    
-    path = os.path.join(SAVE_DIR, filename)
-    with open(path, 'w') as f:
-        json.dump(convert(results), f, indent=2)
-    print(f"  Saved: {path}")
-
-
-#==============================================================================
-# Visualization
-#==============================================================================
-def plot_detailed_results(results):
-    """Generate heatmap and analysis plots"""
-    noise_rates = sorted([exp['noise_rate'] for exp in results['experiments']])
-    alpha_values = sorted([float(a) for a in results['experiments'][0]['alpha_results'].keys()])
-    
-    # Create matrix of R(T*) values
-    R_matrix = np.zeros((len(noise_rates), len(alpha_values)))
-    
-    for i, exp in enumerate(sorted(results['experiments'], key=lambda x: x['noise_rate'])):
-        for j, alpha in enumerate(alpha_values):
-            alpha_str = str(alpha)
-            res = exp['alpha_results'].get(alpha_str, {})
-            t34 = res.get('theorem_3_4', {})
-            R_matrix[i, j] = t34.get('min_R_clean', np.nan) if t34 else np.nan
-    
-    # Figure 1: Detailed Heatmap
-    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
-    
-    # Left: Full heatmap
-    ax = axes[0]
-    im = ax.imshow(R_matrix, aspect='auto', cmap='RdYlGn_r', origin='lower')
-    
-    # Show fewer ticks for readability
-    xtick_step = max(1, len(alpha_values) // 10)
-    ytick_step = max(1, len(noise_rates) // 10)
-    
-    ax.set_xticks(range(0, len(alpha_values), xtick_step))
-    ax.set_xticklabels([f'{alpha_values[i]:.1f}' for i in range(0, len(alpha_values), xtick_step)])
-    ax.set_yticks(range(0, len(noise_rates), ytick_step))
-    ax.set_yticklabels([f'{noise_rates[i]*100:.0f}%' for i in range(0, len(noise_rates), ytick_step)])
-    
-    ax.set_xlabel('α')
-    ax.set_ylabel('Noise Rate ρ')
-    ax.set_title('Test Loss R(T*) - Detailed Heatmap\n(Lighter = Better)')
-    plt.colorbar(im, ax=ax)
-    
-    # Mark best α for each noise rate (safe for all-NaN rows)
-    for i in range(len(noise_rates)):
-        row = R_matrix[i, :]
-        if np.all(np.isnan(row)):
-            continue   # この noise rate は全 α で失敗 → 描かない
-        best_j = np.nanargmin(row)
-        ax.scatter([best_j], [i], marker='*', s=100, c='blue',
-                  edgecolors='white', linewidths=1)
-    
-    # Right: Best α vs noise rate
-    ax = axes[1]
-    best_alphas = []
-    for i in range(len(noise_rates)):
-        row = R_matrix[i, :]
-        if np.all(np.isnan(row)):
-            best_alphas.append(np.nan)
-        else:
-            best_alphas.append(alpha_values[np.nanargmin(row)])
-
-    ax.plot([r*100 for r in noise_rates], best_alphas, 'bo-', markersize=4, linewidth=1)
-    ax.set_xlabel('Noise Rate ρ (%)')
-    ax.set_ylabel('Optimal α')
-    ax.set_title('Optimal α vs Noise Rate (1% resolution)')
-    ax.grid(True, alpha=0.3)
-    ax.axhline(y=0, color='red', linestyle='--', alpha=0.5, label='ReLU (α=0)')
-    ax.axhline(y=-1, color='green', linestyle=':', alpha=0.5, label='Absolute (α=-1)')
-    ax.legend()
-    ax.set_ylim(-1.1, 0.1)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(SAVE_DIR, 'detailed_heatmap.png'), dpi=150)
-    plt.close()
-    
-    # Figure 2: α=0 vs α=-1 comparison
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    R_alpha0 = []
-    R_alpha_neg1 = []
-    
-    for exp in sorted(results['experiments'], key=lambda x: x['noise_rate']):
-        r0 = exp['alpha_results'].get('0.0', {}).get('theorem_3_4', {})
-        r1 = exp['alpha_results'].get('-1.0', {}).get('theorem_3_4', {})
-        R_alpha0.append(r0.get('min_R_clean', np.nan) if r0 else np.nan)
-        R_alpha_neg1.append(r1.get('min_R_clean', np.nan) if r1 else np.nan)
-    
-    ax.plot([r*100 for r in noise_rates], R_alpha0, 'b-o', label='α=0 (ReLU)', markersize=4)
-    ax.plot([r*100 for r in noise_rates], R_alpha_neg1, 'r-s', label='α=-1 (Absolute)', markersize=4)
-    
-    # Mark where α=-1 becomes better
-    diff = np.array(R_alpha0) - np.array(R_alpha_neg1)
-    crossover_idx = np.where(diff > 0)[0]
-    if len(crossover_idx) > 0:
-        crossover_rho = noise_rates[crossover_idx[0]] * 100
-        ax.axvline(x=crossover_rho, color='gray', linestyle='--', alpha=0.7, 
-                   label=f'Crossover at ρ≈{crossover_rho:.0f}%')
-    
-    ax.set_xlabel('Noise Rate ρ (%)')
-    ax.set_ylabel('Test Loss R(T*)')
-    ax.set_title('α=0 vs α=-1: Which is Better?')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(SAVE_DIR, 'alpha_comparison.png'), dpi=150)
-    plt.close()
-    
-    # Figure 3: Difference plot
-    fig, ax = plt.subplots(figsize=(10, 6))
-    
-    diff = np.array(R_alpha0) - np.array(R_alpha_neg1)
-    colors = ['blue' if d < 0 else 'red' for d in diff]
-    ax.bar([r*100 for r in noise_rates], diff, color=colors, width=0.8, alpha=0.7)
-    ax.axhline(y=0, color='black', linestyle='-', linewidth=1)
-    ax.set_xlabel('Noise Rate ρ (%)')
-    ax.set_ylabel('R(α=0) - R(α=-1)')
-    ax.set_title('Difference: Positive = α=-1 Better, Negative = α=0 Better')
-    ax.grid(True, alpha=0.3, axis='y')
-    
-    plt.tight_layout()
-    plt.savefig(os.path.join(SAVE_DIR, 'difference_plot.png'), dpi=150)
-    plt.close()
-    
-    print(f"\nPlots saved to {SAVE_DIR}/")
-
-
-def print_summary(results):
-    print("\n" + "="*70)
-    print("SUMMARY: Best α for each noise rate")
-    print("="*70)
-    
-    print(f"\n{'ρ':<8} {'Best α':<8} {'R(T*)':<12} {'R(α=0)':<12} {'R(α=-1)':<12} {'Winner':<10}")
-    print("-"*70)
-    
-    for exp in sorted(results['experiments'], key=lambda x: x['noise_rate']):
-        noise_rate = exp['noise_rate']
-        
-        best_alpha = None
-        best_loss = float('inf')
-        
-        for alpha, data in exp['alpha_results'].items():
-            if data['theorem_3_4'] and data['theorem_3_4']['min_R_clean'] < best_loss:
-                best_loss = data['theorem_3_4']['min_R_clean']
-                best_alpha = float(alpha)
-        
-        R_0 = exp['alpha_results'].get('0.0', {}).get('theorem_3_4', {}).get('min_R_clean', np.nan)
-        R_neg1 = exp['alpha_results'].get('-1.0', {}).get('theorem_3_4', {}).get('min_R_clean', np.nan)
-        
-        if not np.isnan(R_0) and not np.isnan(R_neg1):
-            winner = 'α=-1' if R_0 > R_neg1 else 'α=0'
-        else:
-            winner = 'N/A'
-        
-        print(f"{noise_rate*100:5.0f}%   {best_alpha:6.2f}   {best_loss:<12.4f} {R_0:<12.4f} {R_neg1:<12.4f} {winner:<10}")
-
-
-def find_crossover_point(results):
-    """Find the noise rate where α=-1 becomes better than α=0"""
-    print("\n" + "="*70)
-    print("CROSSOVER ANALYSIS")
-    print("="*70)
-    
-    crossover_points = []
-    
-    sorted_exps = sorted(results['experiments'], key=lambda x: x['noise_rate'])
-    
-    for i, exp in enumerate(sorted_exps):
-        R_0 = exp['alpha_results'].get('0.0', {}).get('theorem_3_4', {}).get('min_R_clean', None)
-        R_neg1 = exp['alpha_results'].get('-1.0', {}).get('theorem_3_4', {}).get('min_R_clean', None)
-        
-        if R_0 and R_neg1:
-            diff = R_0 - R_neg1  # Positive means α=-1 is better
-            
-            if i > 0:
-                prev_exp = sorted_exps[i-1]
-                prev_R_0 = prev_exp['alpha_results'].get('0.0', {}).get('theorem_3_4', {}).get('min_R_clean', None)
-                prev_R_neg1 = prev_exp['alpha_results'].get('-1.0', {}).get('theorem_3_4', {}).get('min_R_clean', None)
-                
-                if prev_R_0 and prev_R_neg1:
-                    prev_diff = prev_R_0 - prev_R_neg1
-                    
-                    # Check for sign change
-                    if prev_diff < 0 and diff > 0:
-                        # Linear interpolation
-                        rho_prev = prev_exp['noise_rate']
-                        rho_curr = exp['noise_rate']
-                        crossover_rho = rho_prev + (rho_curr - rho_prev) * (-prev_diff) / (diff - prev_diff)
-                        crossover_points.append(crossover_rho)
-                        print(f"Crossover between ρ={rho_prev*100:.0f}% and ρ={rho_curr*100:.0f}%")
-                        print(f"  Estimated crossover point: ρ ≈ {crossover_rho*100:.1f}%")
-    
-    if crossover_points:
-        print(f"\nMain crossover: α=-1 becomes better than α=0 at ρ ≈ {crossover_points[0]*100:.1f}%")
-    else:
-        print("\nNo clear crossover found in the tested range.")
-    
-    return crossover_points
-
-
-#==============================================================================
+# ================================================================================
 # Main
-#==============================================================================
+# ================================================================================
 def main():
-    # Detailed configuration: α in 0.1 steps, noise rate in 1% steps
     config = {
         'input_dim': 784,
         'num_classes': 10,
@@ -622,29 +624,33 @@ def main():
         'lr': 0.005,
         'seed': 42,
         'record_every': 5,
-        # α: 0.1 steps from 0.0 to -1.0
-        'alpha_values': [round(x * 0.1, 1) for x in range(0, -11, -1)],  # [0.0, -0.1, ..., -1.0]
+        # α: from -1.0 to +0.9 in 0.1 steps (20 values, excluding 1.0)
+        'alpha_values': [round(x * 0.1, 1) for x in range(-10, 10)],
         # Noise rate: 1% steps from 0% to 30%
-        'noise_rates': [round(x * 0.01, 2) for x in range(0, 31)],  # [0.0, 0.01, ..., 0.30]
+        'noise_rates': [round(x * 0.01, 2) for x in range(0, 31)],
     }
     
     total_runs = len(config['alpha_values']) * len(config['noise_rates'])
-    print(f"Detailed experiment: {total_runs} runs")
-    print(f"α values: {config['alpha_values']}")
-    print(f"Noise rates: {[f'{r*100:.0f}%' for r in config['noise_rates'][:5]]} ... {[f'{r*100:.0f}%' for r in config['noise_rates'][-3:]]}")
-    print(f"Estimated time on RTX 3090 Ti: ~{total_runs * 1.4 / 60:.1f} minutes")
+    print(f"Extended experiment: {total_runs} runs")
+    print(f"α values ({len(config['alpha_values'])}): {config['alpha_values']}")
+    print(f"Noise rates: {len(config['noise_rates'])} values (0% to 30%)")
+    print(f"Estimated time: ~{total_runs * 1.4 / 60:.1f} minutes")
     
-    results = run_detailed_experiment(config)
+    # Run experiment
+    results = run_experiment(config)
     
-    save_results(results, 'detailed_results.json')
+    # Save final results
+    save_results(results, 'extended_results.json')
     
-    plot_detailed_results(results)
+    # Generate plots
+    diffs = plot_results(results)
     
-    print_summary(results)
+    # Print summary
+    print_summary(results, diffs)
     
-    find_crossover_point(results)
-    
-    print("\nDone!")
+    print("\n" + "="*60)
+    print("COMPLETED!")
+    print("="*60)
 
 
 if __name__ == '__main__':
