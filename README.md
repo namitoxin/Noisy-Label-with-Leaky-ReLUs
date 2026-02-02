@@ -19,7 +19,7 @@ heatmap.png
 Heatmap of optimal clean test loss over noise rate and α
 
 comparison.png  
-Comparison between α = 0 (ReLU) and α = −1 (absolute activation)
+Comparison between α = 0.9 to α = −1 (absolute activation)
 
 difference.png  
 Difference plot: R(α = 0) − R(α = −1)
@@ -57,8 +57,7 @@ Brighter colors indicate better generalization performance.
 
 ### comparison.png
 Direct comparison of clean test loss between:
-- α = 0 (ReLU)
-- α = −1 (absolute value activation)
+- α = 0.9 to α = −1 (absolute value activation)
 
 across different noise rates.
 
